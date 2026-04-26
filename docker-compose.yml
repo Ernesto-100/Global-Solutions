@@ -1,0 +1,154 @@
+version: "3.9"
+
+services:
+  # ─── Infrastructure ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: truebooks
+      POSTGRES_PASSWORD: truebooks
+      POSTGRES_DB: truebooks
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U truebooks"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── API Backend ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://truebooks:truebooks@postgres:5432/truebooks
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      FROM_EMAIL: ${FROM_EMAIL}
+      JWT_SECRET: ${NEXTAUTH_SECRET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./api:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─── AI Agent System ─────────────────────────────────────────────────────────
+  agents:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DATABASE_URL: postgresql://truebooks:truebooks@postgres:5432/truebooks
+      REDIS_URL: redis://redis:6379
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8001:8001"
+    depends_on:
+      - api
+      - redis
+    volumes:
+      - ./agents:/app
+    command: python orchestrator.py
+
+  # ─── Marketing Website ───────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: http://api:8000
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://api:8000
+      APP_URL: http://app:3001
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  # ─── Core Bookkeeping App ────────────────────────────────────────────────────
+  app:
+    build:
+      context: ./apps/app
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: http://api:8000
+        NEXTAUTH_URL: http://localhost:3001
+    restart: unless-stopped
+    environment:
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      NEXTAUTH_URL: http://localhost:3001
+      API_BASE_URL: http://api:8000
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY}
+    ports:
+      - "3001:3001"
+    depends_on:
+      - api
+
+  # ─── Admin Dashboard ─────────────────────────────────────────────────────────
+  admin:
+    build:
+      context: ./apps/admin
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://api:8000
+      AGENTS_URL: http://agents:8001
+    ports:
+      - "3002:3002"
+    depends_on:
+      - api
+      - agents
+
+  # ─── Reverse Proxy ───────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./infrastructure/nginx/certs:/etc/nginx/certs
+    depends_on:
+      - web
+      - app
+      - api
+      - admin
+
+volumes:
+  postgres_data:
+  redis_data:
